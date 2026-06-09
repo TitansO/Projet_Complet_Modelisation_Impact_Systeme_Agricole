@@ -1,0 +1,267 @@
+###############################################################################
+# Climat IA — Docker Compose
+# Architecture Polyglotte : PostgreSQL · Apache Cassandra · Redis · FastAPI
+# Réseau : reseau_ia_climat (172.28.0.0/24) | DNS interne automatique
+###############################################################################
+
+networks:
+  reseau_ia_climat:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          gateway: 172.28.0.1
+    labels:
+      project: climat_ia
+
+volumes:
+  postgres_data_vol:
+    driver: local
+    labels:
+      project: climat_ia
+      purpose: relational_profiles_and_metrics
+  cassandra_data_vol:
+    driver: local
+    labels:
+      project: climat_ia
+      purpose: nosql_timeseries_climate_streams
+  redis_data_vol:
+    driver: local
+    labels:
+      project: climat_ia
+      purpose: inmemory_prediction_cache
+
+services:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. BASE RELATIONNELLE — PostgreSQL 16
+  #    Rôle : cohérence forte (ACID) pour profils agronomiques finalisés,
+  #           scénarios RCP validés et métriques de clustering.
+  # ─────────────────────────────────────────────────────────────────────────
+  base_donnees_postgres:
+    image: postgres:16-alpine
+    container_name: climat_postgres
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-climat_ia_db}
+      POSTGRES_USER: ${POSTGRES_USER:-climat_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Cl1mat_S3cur3_2025!}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data_vol:/var/lib/postgresql/data
+      - ./db/postgres_init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    networks:
+      reseau_ia_climat:
+        ipv4_address: 172.28.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-climat_user} -d ${POSTGRES_DB:-climat_ia_db}"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.50"
+        reservations:
+          memory: 256M
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. BASE NoSQL — Apache Cassandra 4.1
+  #    Rôle : modèle AP, architecture masterless en anneau pour les séries
+  #           temporelles climatiques brutes des 3 systèmes de production.
+  # ─────────────────────────────────────────────────────────────────────────
+  nosql_cassandra:
+    image: cassandra:4.1
+    container_name: climat_cassandra
+    restart: unless-stopped
+    environment:
+      CASSANDRA_CLUSTER_NAME: ClimateCluster
+      CASSANDRA_DC: datacenter_ouest_africain
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      CASSANDRA_NUM_TOKENS: 256
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+    volumes:
+      - cassandra_data_vol:/var/lib/cassandra
+      - ./db/cassandra_init.cql:/docker-entrypoint-initdb.d/cassandra_init.cql:ro
+    networks:
+      reseau_ia_climat:
+        ipv4_address: 172.28.0.20
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool status | grep -q UN"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: "0.75"
+        reservations:
+          memory: 512M
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. CACHE IN-MEMORY — Redis 7
+  #    Rôle : couche de cache pour les prédictions de clusters (TTL 3600s)
+  #           afin de décharger PostgreSQL — latence infra-milliseconde.
+  # ─────────────────────────────────────────────────────────────────────────
+  cache_redis:
+    image: redis:7-alpine
+    container_name: climat_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 128mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD:-RedisClim@t2025!}
+    volumes:
+      - redis_data_vol:/data
+    networks:
+      reseau_ia_climat:
+        ipv4_address: 172.28.0.30
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-RedisClim@t2025!}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+          cpus: "0.25"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 4. API GATEWAY — FastAPI (asynchrone)
+  #    Rôle : exposition REST, logique cache-aside Redis → PostgreSQL,
+  #           endpoint /predict pour l'inférence K-Means des clusters.
+  # ─────────────────────────────────────────────────────────────────────────
+  api_climat:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: climat_api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: base_donnees_postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-climat_ia_db}
+      POSTGRES_USER: ${POSTGRES_USER:-climat_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Cl1mat_S3cur3_2025!}
+      REDIS_HOST: cache_redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-RedisClim@t2025!}
+      REDIS_TTL_SECONDS: 3600
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    networks:
+      reseau_ia_climat:
+        ipv4_address: 172.28.0.40
+    depends_on:
+      base_donnees_postgres:
+        condition: service_healthy
+      cache_redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+          cpus: "0.50"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 5. WORKER DE CLUSTERING — Pipeline K-Means
+  #    Rôle : lecture async depuis Cassandra, clustering des séries
+  #           temporelles brutes, écriture des profils dans PostgreSQL.
+  # ─────────────────────────────────────────────────────────────────────────
+  worker_clustering:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: climat_worker
+    restart: "no"
+    env_file: .env
+    environment:
+      CASSANDRA_HOST: nosql_cassandra
+      CASSANDRA_PORT: 9042
+      CASSANDRA_KEYSPACE: climat_ia_ks
+      POSTGRES_HOST: base_donnees_postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-climat_ia_db}
+      POSTGRES_USER: ${POSTGRES_USER:-climat_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Cl1mat_S3cur3_2025!}
+      N_CLUSTERS: 4
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    networks:
+      reseau_ia_climat:
+        ipv4_address: 172.28.0.50
+    depends_on:
+      nosql_cassandra:
+        condition: service_healthy
+      base_donnees_postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.00"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 6. REVERSE PROXY — NGINX
+  #    Rôle : point d'entrée unique (port 80), routage /api/* et /app/*
+  #           vers les services backend et frontend par DNS Docker.
+  # ─────────────────────────────────────────────────────────────────────────
+  reverse_proxy:
+    image: nginx:1.27-alpine
+    container_name: climat_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./climat_ia.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      reseau_ia_climat:
+        ipv4_address: 172.28.0.60
+    depends_on:
+      api_climat:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: "0.10"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 7. FRONTEND — Streamlit (optionnel, démarrage manuel)
+  # ─────────────────────────────────────────────────────────────────────────
+  frontend_streamlit:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: climat_frontend
+    restart: unless-stopped
+    environment:
+      API_BASE_URL: http://reverse_proxy/api
+    networks:
+      reseau_ia_climat:
+        ipv4_address: 172.28.0.70
+    depends_on:
+      - reverse_proxy
+    profiles:
+      - full
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.25"
