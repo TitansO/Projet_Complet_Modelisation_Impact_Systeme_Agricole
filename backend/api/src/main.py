@@ -1,22 +1,17 @@
-"""
-Climat IA — API FastAPI Asynchrone
-====================================
-Logique de cache-aside Redis → PostgreSQL pour l'endpoint /predict.
-Architecture : Cache Miss → interrogation PostgreSQL + écriture Redis (TTL 3600s)
-               Cache Hit  → réponse directe Redis (latence < 1ms)
-
-Systèmes agricoles (TFE Delandmeter, 2021) :
-  - Systeme_Grandes_Cultures   (BAU)
-  - Systeme_Polyculture_Elevage (Vegan)
-  - Systeme_Agroecologique      (ICLS — haute résilience)
-"""
+# =============================================================================
+# Climat IA — API FastAPI Asynchrone (Version Production Corrigée)
+# =============================================================================
+# Logique de cache-aside Redis → PostgreSQL pour l'endpoint /predict.
+# Architecture : Cache Miss → interrogation PostgreSQL + écriture Redis (TTL 3600s)
+#                Cache Hit  → réponse directe Redis (latence < 1ms)
+# =============================================================================
 
 import json
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, status
@@ -26,7 +21,7 @@ import asyncpg
 import numpy as np
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration
+# Configuration et Environnement
 # ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "info").upper())
 logger = logging.getLogger("climat_ia_api")
@@ -84,17 +79,17 @@ class PredictionResponse(BaseModel):
     impact_rendement:    str
     temperature_c_moy:   float
     pluviometrie_mm_moy: float
-    score_silhouette:    Optional[float]
+    score_silhouette:    Optional[float] = None
     cache_hit:           bool
     latence_ms:          int
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# État global de l'application (connexions persistantes)
+# État global de l'application (Connexions persistantes)
 # ─────────────────────────────────────────────────────────────────────────────
 class AppState:
-    pg_pool:    Optional[asyncpg.Pool]         = None
-    redis_client: Optional[aioredis.Redis]     = None
+    pg_pool:      Optional[asyncpg.Pool]   = None
+    redis_client: Optional[aioredis.Redis] = None
 
 
 app_state = AppState()
@@ -102,41 +97,89 @@ app_state = AppState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialisation et fermeture des connexions au démarrage/arrêt de l'API."""
-    # ── Connexion PostgreSQL ──────────────────────────────────────────────
-    logger.info("Connexion au pool PostgreSQL…")
-    app_state.pg_pool = await asyncpg.create_pool(
-        dsn=POSTGRES_DSN,
-        min_size=2,
-        max_size=10,
-        command_timeout=30,
-        max_inactive_connection_lifetime=300,
-    )
-    logger.info("Pool PostgreSQL établi.")
+    """Initialisation et fermeture sécurisée des connexions réseau."""
+    # ── Connexion PostgreSQL avec retry automatique au clonage ────────────
+    logger.info("Connexion au pool PostgreSQL...")
+    for attempt in range(1, 6):
+        try:
+            app_state.pg_pool = await asyncpg.create_pool(
+                dsn=POSTGRES_DSN,
+                min_size=2,
+                max_size=10,
+                command_timeout=30,
+                max_inactive_connection_lifetime=300,
+            )
+            logger.info("Pool PostgreSQL établi avec succès.")
+            break
+        except Exception as e:
+            if attempt == 5:
+                logger.error("Impossible de joindre PostgreSQL après 5 tentatives. Abandon.")
+                raise e
+            logger.warning(f"PostgreSQL indisponible (Essai {attempt}/5)... Nouvelle tentative dans 3s")
+            await time.sleep(3)
+
+    # Vérification/Création de secours de la table des profils si absente au clonage
+    async with app_state.pg_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS profils_agronomiques (
+                systeme_production VARCHAR(50),
+                scenario_rcp VARCHAR(10),
+                cluster_id INT,
+                profil_climatique TEXT,
+                impact_rendement TEXT,
+                temperature_c_moy NUMERIC,
+                pluviometrie_mm_moy NUMERIC,
+                score_silhouette NUMERIC,
+                PRIMARY KEY (systeme_production, scenario_rcp, cluster_id)
+            );
+        """)
+        
+        # Sécurisation de la table de logs d'inférence
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS logs_inference (
+                id SERIAL PRIMARY KEY,
+                systeme_production VARCHAR(50),
+                scenario_rcp VARCHAR(10),
+                temperature_c NUMERIC,
+                pluviometrie_mm NUMERIC,
+                indice_secheresse NUMERIC,
+                radiation_kwh NUMERIC,
+                cluster_id_predit INT,
+                impact_predit TEXT,
+                cache_hit BOOLEAN,
+                latence_ms INT,
+                timestamp TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
 
     # ── Connexion Redis ───────────────────────────────────────────────────
-    logger.info("Connexion au cache Redis…")
-    app_state.redis_client = aioredis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        password=REDIS_PASSWORD,
-        decode_responses=True,
-        socket_connect_timeout=5,
-        socket_keepalive=True,
-    )
-    await app_state.redis_client.ping()
-    logger.info("Cache Redis opérationnel.")
+    logger.info("Connexion au cache Redis...")
+    try:
+        app_state.redis_client = aioredis.Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            password=REDIS_PASSWORD,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_keepalive=True,
+        )
+        await app_state.redis_client.ping()
+        logger.info("Cache Redis opérationnel.")
+    except Exception as exc:
+        logger.error(f"Démarrage dégradé : Redis injoignable ({exc}). L'API utilisera PostgreSQL uniquement.")
 
-    yield  # ← L'API est en service
+    yield  # ← L'API gère activement les requêtes du serveur HTTP
 
-    # ── Nettoyage à l'arrêt ───────────────────────────────────────────────
-    await app_state.pg_pool.close()
-    await app_state.redis_client.aclose()
-    logger.info("Connexions fermées proprement.")
+    # ── Nettoyage propre à l'arrêt ────────────────────────────────────────
+    if app_state.pg_pool:
+        await app_state.pg_pool.close()
+    if app_state.redis_client:
+        await app_state.redis_client.aclose()
+    logger.info("Toutes les connexions de l'infrastructure ont été fermées.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Application FastAPI
+# Application FastAPI Principal
 # ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Climat IA — API de Vulnérabilité Agronomique",
@@ -158,57 +201,41 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Utilitaires — Cache Redis
+# Utilitaires — Cache Réseau
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_cache_key(req: PredictionRequest) -> str:
-    """
-    Clé Redis déterministe pour une requête de prédiction.
-    Granularité : (système, scénario, température arrondie à 1°C,
-                   pluviométrie arrondie à 50mm, indice sécheresse arrondi à 0.1)
-    Cette granularité permet la réutilisation du cache pour des requêtes
-    climatiquement équivalentes sans multiplication excessive des clés.
-    """
+    """Génère une clé de hachage Redis distribuée."""
     t_bucket  = round(req.temperature_c)
     p_bucket  = int(req.pluviometrie_mm // 50) * 50
     s_bucket  = round(req.indice_secheresse, 1)
-    return (
-        f"predict:"
-        f"{req.systeme_production}:"
-        f"{req.scenario_rcp}:"
-        f"{t_bucket}:"
-        f"{p_bucket}:"
-        f"{s_bucket}"
-    )
+    return f"predict:{req.systeme_production}:{req.scenario_rcp}:{t_bucket}:{p_bucket}:{s_bucket}"
 
 
 async def _get_from_cache(key: str) -> Optional[dict]:
-    """Lecture depuis Redis. Retourne None en cas de Cache Miss ou d'erreur."""
+    if not app_state.redis_client:
+        return None
     try:
         raw = await app_state.redis_client.get(key)
         if raw:
-            logger.debug("Cache HIT pour clé : %s", key)
             return json.loads(raw)
-        logger.debug("Cache MISS pour clé : %s", key)
         return None
     except Exception as exc:
-        # Le cache Redis est optionnel — une panne ne doit pas briser l'API
-        logger.warning("Erreur Redis (cache miss forcé) : %s", exc)
+        logger.warning("Erreur de lecture Redis (Cache Miss forcé) : %s", exc)
         return None
 
 
 async def _set_in_cache(key: str, data: dict) -> None:
-    """Écriture dans Redis avec TTL. Silencieuse en cas d'erreur."""
+    if not app_state.redis_client:
+        return
     try:
         await app_state.redis_client.setex(key, REDIS_TTL, json.dumps(data))
-        logger.debug("Cache SET clé %s (TTL %ds)", key, REDIS_TTL)
     except Exception as exc:
-        logger.warning("Échec écriture Redis (non bloquant) : %s", exc)
+        logger.warning("Échec de l'écriture asynchrone dans Redis : %s", exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Utilitaires — K-Means en mémoire (classification par distance euclidienne)
+# Classification Euclidienne K-Means en mémoire
 # ─────────────────────────────────────────────────────────────────────────────
-# Centroïdes pré-entraînés (normalisés Z-score, μ et σ calculés sur le dataset)
 _CENTROÏDES = np.array([
     [27.0, 1450.0, 0.18, 95.0],    # Cluster 0 — Tropical humide
     [36.0,  280.0, 0.82, 210.0],   # Cluster 1 — Aride chaud (Sahel)
@@ -220,9 +247,7 @@ _MU    = np.array([27.0, 707.5, 0.4825, 158.75])
 _SIGMA = np.array([7.5,  477.0, 0.265,  46.00])
 
 
-def _predict_cluster(temperature: float, pluvio: float,
-                     secheresse: float, radiation: float) -> int:
-    """Classification par distance euclidienne aux centroïdes (O(k×d))."""
+def _predict_cluster(temperature: float, pluvio: float, secheresse: float, radiation: float) -> int:
     x = np.array([temperature, pluvio, secheresse, radiation])
     x_norm = (x - _MU) / _SIGMA
     centroïdes_norm = (_CENTROÏDES - _MU) / _SIGMA
@@ -232,24 +257,13 @@ def _predict_cluster(temperature: float, pluvio: float,
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Endpoint : POST /predict
-# Pattern cache-aside : Redis → PostgreSQL → Redis (mise en cache du résultat)
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/predict", response_model=PredictionResponse, status_code=status.HTTP_200_OK)
 async def predict_vulnerabilite(req: PredictionRequest) -> PredictionResponse:
-    """
-    Prédiction du profil de vulnérabilité agronomique.
-
-    Logique cache-aside :
-    1. Calcul de la clé Redis déterministe pour la requête.
-    2. Vérification du cache Redis (GET).
-       → Cache HIT : retour immédiat depuis Redis (latence < 1ms).
-       → Cache MISS : classification K-Means + requête PostgreSQL + écriture Redis.
-    3. Enregistrement du log d'inférence dans PostgreSQL (non bloquant).
-    """
     t_start = time.monotonic()
     cache_key = _build_cache_key(req)
 
-    # ─── Étape 1 : Vérification Redis ────────────────────────────────────
+    # 1. Traitement du Cache (Redis Hit)
     cached = await _get_from_cache(cache_key)
     if cached:
         latence = int((time.monotonic() - t_start) * 1000)
@@ -257,13 +271,13 @@ async def predict_vulnerabilite(req: PredictionRequest) -> PredictionResponse:
         cached["latence_ms"] = latence
         return PredictionResponse(**cached)
 
-    # ─── Étape 2 : Classification K-Means ────────────────────────────────
+    # 2. Inférence Locale K-Means
     cluster_id = _predict_cluster(
         req.temperature_c, req.pluviometrie_mm,
         req.indice_secheresse, req.radiation_kwh,
     )
 
-    # ─── Étape 3 : Interrogation PostgreSQL ──────────────────────────────
+    # 3. Interrogation de la ressource PostgreSQL
     query = """
         SELECT cluster_id, profil_climatique, impact_rendement,
                temperature_c_moy, pluviometrie_mm_moy, score_silhouette
@@ -273,26 +287,31 @@ async def predict_vulnerabilite(req: PredictionRequest) -> PredictionResponse:
           AND cluster_id = $3
         LIMIT 1
     """
-    async with app_state.pg_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            query, req.systeme_production, req.scenario_rcp, cluster_id
-        )
+    row = None
+    try:
+        async with app_state.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(query, req.systeme_production, req.scenario_rcp, cluster_id)
+    except Exception as db_err:
+        logger.error(f"Erreur d'exécution SQL : {db_err}")
+        raise HTTPException(status_code=500, detail="Erreur interne d'accès à la base de données.")
 
+    # Fallback intelligent si le Worker n'a pas encore injecté les profils (Évite le crash post-clonage)
     if not row:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                f"Aucun profil trouvé pour {req.systeme_production} / "
-                f"{req.scenario_rcp} / cluster {cluster_id}. "
-                "Exécutez d'abord le worker de clustering."
-            ),
-        )
+        logger.warning(f"Profils non encore générés en base pour le cluster {cluster_id}. Génération d'une réponse par défaut.")
+        row = {
+            "cluster_id": cluster_id,
+            "profil_climatique": f"Cluster Temporaire {cluster_id} (Données en cours de calcul)",
+            "impact_rendement": "En attente d'analyse",
+            "temperature_c_moy": req.temperature_c,
+            "pluviometrie_mm_moy": req.pluviometrie_mm,
+            "score_silhouette": 0.0
+        }
 
-    # ─── Étape 4 : Construction de la réponse ────────────────────────────
+    # 4. Consolidation des données de sortie
     result_data = {
         "systeme_production":  req.systeme_production,
         "scenario_rcp":        req.scenario_rcp,
-        "cluster_id":          row["cluster_id"],
+        "cluster_id":          int(row["cluster_id"]),
         "profil_climatique":   row["profil_climatique"],
         "impact_rendement":    row["impact_rendement"],
         "temperature_c_moy":   float(row["temperature_c_moy"]),
@@ -301,10 +320,10 @@ async def predict_vulnerabilite(req: PredictionRequest) -> PredictionResponse:
         "cache_hit":           False,
     }
 
-    # ─── Étape 5 : Mise en cache Redis ───────────────────────────────────
+    # 5. Écriture non-bloquante dans le cache Redis
     await _set_in_cache(cache_key, result_data)
 
-    # ─── Étape 6 : Log d'inférence PostgreSQL (fire-and-forget) ──────────
+    # 6. Journalisation asynchrone des métriques d'inférence (Sûreté de l'état)
     latence = int((time.monotonic() - t_start) * 1000)
     log_query = """
         INSERT INTO logs_inference
@@ -320,50 +339,50 @@ async def predict_vulnerabilite(req: PredictionRequest) -> PredictionResponse:
                 req.systeme_production, req.scenario_rcp,
                 req.temperature_c, req.pluviometrie_mm,
                 req.indice_secheresse, req.radiation_kwh,
-                cluster_id, row["impact_rendement"], False, latence,
+                cluster_id, result_data["impact_rendement"], False, latence,
             )
     except Exception as exc:
-        logger.warning("Échec log inférence (non bloquant) : %s", exc)
+        logger.warning("Échec d'enregistrement du log d'inférence : %s", exc)
 
     result_data["latence_ms"] = latence
     return PredictionResponse(**result_data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Endpoint : GET /health
+# Endpoints Annexes (Monitoring & Diagnostics)
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health_check() -> dict:
-    """Vérifie la connectivité PostgreSQL et Redis."""
+    """Vérifie l'état de santé de la passerelle et de ses dépendances."""
     health = {"status": "ok", "api": "up", "postgres": "unknown", "redis": "unknown"}
 
-    try:
-        async with app_state.pg_pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
-        health["postgres"] = "up"
-    except Exception as exc:
-        health["postgres"] = f"down: {exc}"
+    if app_state.pg_pool:
+        try:
+            async with app_state.pg_pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            health["postgres"] = "up"
+        except Exception as exc:
+            health["postgres"] = f"down: {exc}"
+            health["status"] = "degraded"
+    else:
+        health["postgres"] = "pool_uninitialized"
         health["status"] = "degraded"
 
-    try:
-        await app_state.redis_client.ping()
-        health["redis"] = "up"
-    except Exception as exc:
-        health["redis"] = f"down: {exc}"
-        # Redis non critique — l'API continue à fonctionner (cache miss total)
+    if app_state.redis_client:
+        try:
+            await app_state.redis_client.ping()
+            health["redis"] = "up"
+        except Exception as exc:
+            health["redis"] = f"down: {exc}"
+    else:
+        health["redis"] = "disabled"
 
     return health
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Endpoint : GET /profils
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/profils")
-async def liste_profils(
-    systeme: Optional[str] = None,
-    scenario: Optional[str] = None,
-) -> list[dict]:
-    """Liste les profils agronomiques disponibles dans PostgreSQL."""
+async def liste_profils(systeme: Optional[str] = None, scenario: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Retourne les profils disponibles stockés de manière relationnelle."""
     query = """
         SELECT systeme_production, scenario_rcp, cluster_id,
                profil_climatique, impact_rendement,
@@ -373,6 +392,9 @@ async def liste_profils(
           AND ($2::TEXT IS NULL OR scenario_rcp = $2)
         ORDER BY systeme_production, scenario_rcp, cluster_id
     """
+    if not app_state.pg_pool:
+        raise HTTPException(status_code=503, detail="Base de données non initialisée.")
+        
     async with app_state.pg_pool.acquire() as conn:
         rows = await conn.fetch(query, systeme, scenario)
     return [dict(r) for r in rows]
